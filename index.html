@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BIG BROTHER — Purchase Payment History V1</title>
+<title>BIG BROTHER — Purchase Payment History V1.1 Smart Sync Storage</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;background:#f4f7fb;color:#1f2937;font-family:Inter,Arial,sans-serif}
@@ -106,11 +106,151 @@ th{background:#f8fafc;color:#475569;position:sticky;top:0}
 const PURCHASE_DATABASE_API_URL="https://script.google.com/macros/s/AKfycbz7k1iBBfx9xiIKl1719W_jsKA8kLl7ihD4UykIyIAk-btXvAiOsORiw71NWwUD6XFOgg/exec";
 let payments=[];
 
+const PAYMENT_HISTORY_CACHE_KEY="BB_PURCHASE_PAYMENT_HISTORY_CACHE_V1";
+const PAYMENT_HISTORY_SYNC_INTERVAL_MS=20000;
+
+let paymentHistoryRevision="";
+let paymentHistorySyncBusy=false;
+let paymentHistorySyncTimer=null;
+
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function num(v){const n=Number(v);return Number.isFinite(n)?n:0;}
 function money(v,c="USD"){const n=num(v);return String(c).toUpperCase()==="KHR"?n.toLocaleString("en-US",{maximumFractionDigits:0})+" ៛":"$"+n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});}
 function setStatus(m,t=""){const e=document.getElementById("status");e.textContent=m;e.className="status"+(t?" "+t:"");}
 function arrayOf(r){if(Array.isArray(r))return r;if(Array.isArray(r?.data))return r.data;return [];}
+
+
+function formatDateOnly(value){
+  if(!value) return "";
+
+  if(value instanceof Date && !isNaN(value)){
+    return String(value.getDate()).padStart(2,"0")+"/"+
+      String(value.getMonth()+1).padStart(2,"0")+"/"+
+      value.getFullYear();
+  }
+
+  const s=String(value).trim();
+
+  const iso=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if(iso){
+    return String(iso[3]).padStart(2,"0")+"/"+
+      String(iso[2]).padStart(2,"0")+"/"+
+      iso[1];
+  }
+
+  const d=new Date(s);
+  if(!isNaN(d)){
+    return String(d.getDate()).padStart(2,"0")+"/"+
+      String(d.getMonth()+1).padStart(2,"0")+"/"+
+      d.getFullYear();
+  }
+
+  return s
+    .replace(/\s+\d{1,2}:\d{2}:\d{2}.*$/,"")
+    .replace(/\s+GMT[+-]\d{4}.*$/,"");
+}
+
+function readPaymentHistoryCache(){
+  try{
+    const raw=localStorage.getItem(PAYMENT_HISTORY_CACHE_KEY);
+    if(!raw) return null;
+
+    const parsed=JSON.parse(raw);
+    if(!parsed || !Array.isArray(parsed.payments)) return null;
+
+    return parsed;
+  }catch(_){
+    return null;
+  }
+}
+
+function savePaymentHistoryCache(revision){
+  try{
+    const payload={
+      revision:String(revision||paymentHistoryRevision||""),
+      savedAt:Date.now(),
+      payments:Array.isArray(payments)?payments:[]
+    };
+
+    localStorage.setItem(PAYMENT_HISTORY_CACHE_KEY,JSON.stringify(payload));
+
+    if(payload.revision){
+      paymentHistoryRevision=payload.revision;
+    }
+  }catch(error){
+    console.warn("Purchase Payment History cache unavailable:",error);
+  }
+}
+
+function renderPaymentHistoryCache(){
+  const cached=readPaymentHistoryCache();
+  if(!cached) return false;
+
+  paymentHistoryRevision=String(cached.revision||"");
+  payments=cached.payments;
+
+  render();
+  setStatus("Cached • checking for updates...","success");
+  return true;
+}
+
+async function fetchPaymentHistoryRevision(){
+  const r=await getJson(PURCHASE_DATABASE_API_URL,{
+    action:"purchaseHistoryRevision"
+  });
+
+  if(r?.success===false){
+    throw new Error(r.error||"Sync check failed.");
+  }
+
+  return String(r?.revision||"0");
+}
+
+function flashPaymentHistoryStatus(text){
+  setStatus(text,"success");
+
+  clearTimeout(flashPaymentHistoryStatus.timer);
+  flashPaymentHistoryStatus.timer=setTimeout(()=>{
+    setStatus(payments.length+" Purchase Payment record(s) loaded.","success");
+  },1800);
+}
+
+async function paymentHistorySmartSyncTick(forceCheck=false){
+  if(paymentHistorySyncBusy) return;
+  if(document.hidden && !forceCheck) return;
+
+  paymentHistorySyncBusy=true;
+
+  try{
+    const revision=await fetchPaymentHistoryRevision();
+
+    if(paymentHistoryRevision && revision===paymentHistoryRevision){
+      flashPaymentHistoryStatus("Up to date • auto sync 20s");
+      return;
+    }
+
+    paymentHistoryRevision=revision;
+    await loadPayments({silent:true});
+    flashPaymentHistoryStatus("Updated automatically");
+
+  }catch(error){
+    console.warn("Purchase Payment History smart sync failed:",error);
+    // Keep current/cached data on screen and retry next cycle.
+  }finally{
+    paymentHistorySyncBusy=false;
+  }
+}
+
+function startPaymentHistorySmartSync(){
+  if(paymentHistorySyncTimer){
+    clearInterval(paymentHistorySyncTimer);
+  }
+
+  paymentHistorySyncTimer=setInterval(
+    ()=>paymentHistorySmartSyncTick(false),
+    PAYMENT_HISTORY_SYNC_INTERVAL_MS
+  );
+}
 
 function getJson(url,params={}){
   return new Promise((resolve,reject)=>{
@@ -128,16 +268,48 @@ function getJson(url,params={}){
   });
 }
 
-async function loadPayments(){
-  setStatus("Loading Purchase Payment History...");
+async function loadPayments(options={}){
+  const silent=options && options.silent===true;
+
+  if(!silent){
+    setStatus("Loading Purchase Payment History...");
+  }
+
   try{
-    const r=await getJson(PURCHASE_DATABASE_API_URL,{action:"getPurchasePayments"});
-    if(r?.success===false) throw new Error(r.error||"Database error.");
+    const [r,revision]=await Promise.all([
+      getJson(PURCHASE_DATABASE_API_URL,{action:"getPurchasePayments"}),
+      fetchPaymentHistoryRevision().catch(()=>paymentHistoryRevision||"")
+    ]);
+
+    if(r?.success===false){
+      throw new Error(r.error||"Database error.");
+    }
+
     payments=arrayOf(r);
+    paymentHistoryRevision=String(revision||paymentHistoryRevision||"");
+
     render();
-    setStatus(payments.length+" Purchase Payment record(s) loaded.","success");
+    savePaymentHistoryCache(paymentHistoryRevision);
+
+    if(!silent){
+      setStatus(payments.length+" Purchase Payment record(s) loaded.","success");
+    }
+
   }catch(e){
-    console.error(e);payments=[];render();
+    console.error(e);
+
+    const cached=readPaymentHistoryCache();
+
+    if(cached){
+      payments=cached.payments;
+      paymentHistoryRevision=String(cached.revision||paymentHistoryRevision||"");
+      render();
+      setStatus("Cached Payment History shown • sync will retry automatically.","success");
+      return;
+    }
+
+    payments=[];
+    render();
     setStatus("Could not load Purchase Payment History: "+(e.message||"Database connection error."));
   }
 }
@@ -151,8 +323,16 @@ function filtered(){
   return payments.filter(p=>{
     const hay=[p.purchasePaymentId,p.purchaseId,p.clientName,p.transactionId,p.bank,p.processedBy].join(" ").toLowerCase();
     if(q&&!hay.includes(q))return false;
-    if(from&&String(p.paymentDate||"")<from)return false;
-    if(to&&String(p.paymentDate||"")>to)return false;
+    if(from){
+      const raw=String(p.paymentDate||"");
+      const iso=(raw.match(/^(\d{4}-\d{2}-\d{2})/)||[])[1]||"";
+      if(iso && iso<from) return false;
+    }
+    if(to){
+      const raw=String(p.paymentDate||"");
+      const iso=(raw.match(/^(\d{4}-\d{2}-\d{2})/)||[])[1]||"";
+      if(iso && iso>to) return false;
+    }
     if(method&&String(p.paymentMethod||"")!==method)return false;
     return true;
   }).sort((a,b)=>String(b.paymentDate||"").localeCompare(String(a.paymentDate||""))||String(b.purchasePaymentId||"").localeCompare(String(a.purchasePaymentId||"")));
@@ -165,7 +345,7 @@ function render(){
   body.innerHTML=rows.length?rows.map(p=>`
     <tr>
       <td><strong>${esc(p.purchasePaymentId)}</strong></td>
-      <td>${esc(p.paymentDate)}</td>
+      <td>${esc(formatDateOnly(p.paymentDate))}</td>
       <td>${esc(p.purchaseId)}</td>
       <td>${esc(p.clientName)}</td>
       <td><span class="method">${esc(p.paymentMethod||"-")}</span></td>
@@ -175,7 +355,7 @@ function render(){
       <td><strong>${money(p.amount,p.currency)}</strong></td>
       <td>${esc(p.processedBy||"-")}</td>
       <td>${esc(p.note||"-")}</td>
-      <td>${esc(p.createdAt||"-")}</td>
+      <td>${esc(formatDateOnly(p.createdAt)||"-")}</td>
     </tr>`).join(""):'<tr><td colspan="12">No Purchase Payment records found.</td></tr>';
 
   const usd=rows.filter(x=>String(x.currency||"USD")==="USD");
@@ -193,7 +373,23 @@ function clearFilters(){
   document.getElementById("methodFilter").value="";
   render();
 }
-loadPayments();
+(async function initializePurchasePaymentHistory(){
+  const showedCache=renderPaymentHistoryCache();
+
+  if(!showedCache){
+    await loadPayments();
+  }else{
+    await paymentHistorySmartSyncTick(true);
+  }
+
+  startPaymentHistorySmartSync();
+})();
+
+document.addEventListener("visibilitychange",function(){
+  if(!document.hidden){
+    paymentHistorySmartSyncTick(true);
+  }
+});
 </script>
 </body>
 </html>
